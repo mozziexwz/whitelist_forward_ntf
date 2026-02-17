@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# NFTables 防火墙 + 端口转发 一体化管理脚本 (修复版)
+# NFTables 防火墙 + 端口转发 一体化管理脚本 (IPv6修复版)
 # 核心规则：只有白名单IP才能访问VPS（包括转发端口）
 
 # 颜色定义
@@ -144,11 +144,14 @@ table inet unified {
     chain input {
         type filter hook input priority filter; policy drop;
         
-        # 允许已建立的连接 (通用，允许VPS访问外部后的回包)
-        ct state established,related accept
-        
         # 本地回环
         iif lo accept
+        
+        # 允许已建立的连接 (包括VPS主动访问外部后的回包)
+        ct state established,related accept
+        
+        # 允许ICMPv6 (必需，否则IPv6邻居发现等功能会失效)
+        ip6 nexthdr icmpv6 accept
         
         # 白名单IP允许访问本机服务
         ip saddr @allowed_ips accept
@@ -165,6 +168,9 @@ table inet unified {
         # 允许已建立的转发连接 (双向通信)
         ct state established,related accept
         
+        # 允许ICMPv6转发 (用于IPv6路径MTU发现等)
+        ip6 nexthdr icmpv6 accept
+        
         # 只允许白名单IP进行转发访问
         ip saddr @allowed_ips accept
         ip6 saddr @allowed_ips_v6 accept
@@ -175,6 +181,9 @@ table inet unified {
     
     chain output {
         type filter hook output priority filter; policy accept;
+        
+        # 允许所有出站连接 (VPS主动访问外部)
+        # 回包通过 input 链的 ct state established,related 处理
     }
 }
 RULESET
@@ -274,59 +283,52 @@ enable_ip_forward() {
     if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
     else
-        sed -i 's/^#*net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+        sed -i 's/^net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
     fi
     
     if ! grep -q "^net.ipv6.conf.all.forwarding=1" /etc/sysctl.conf; then
         echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+    else
+        sed -i 's/^net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf
     fi
     
-    sysctl -p > /dev/null 2>&1
     echo -e "${GREEN}✓ IP转发已启用${NC}"
 }
 
-# 添加端口转发（支持端口段）
+# 添加端口转发
 add_forward() {
     echo -e "\n${BLUE}【添加端口转发】${NC}"
-    
-    echo -e "${YELLOW}请选择协议:${NC}"
-    echo "1. TCP"
-    echo "2. UDP"
-    echo "3. TCP + UDP"
-    echo -ne "选择 [1-3]: "
+    echo -e "${GREEN}1.${NC} TCP"
+    echo -e "${GREEN}2.${NC} UDP"
+    echo -e "${GREEN}3.${NC} TCP+UDP"
+    echo -ne "${YELLOW}协议: ${NC}"
     read proto_choice
     
+    local protocol
     case $proto_choice in
         1) protocol="tcp" ;;
         2) protocol="udp" ;;
         3) protocol="both" ;;
-        *)
-            echo -e "${RED}无效选择${NC}"
-            return
-            ;;
+        *) echo -e "${RED}无效选择${NC}"; return ;;
     esac
     
-    echo -e "\n${YELLOW}请选择端口类型:${NC}"
-    echo "1. 单个端口"
-    echo "2. 端口段"
-    echo -ne "选择 [1-2]: "
-    read port_type
+    echo -ne "${YELLOW}是否添加端口段? [y/N]: ${NC}"
+    read is_range
     
-    if [ "$port_type" = "2" ]; then
+    if [[ "$is_range" =~ ^[Yy]$ ]]; then
         # 端口段
         echo -ne "${YELLOW}本地起始端口: ${NC}"
         read local_port_start
+        echo -ne "${YELLOW}本地结束端口: ${NC}"
+        read local_port_end
         
-        if ! [[ "$local_port_start" =~ ^[0-9]+$ ]] || [ "$local_port_start" -lt 1 ] || [ "$local_port_start" -gt 65535 ]; then
+        if ! [[ "$local_port_start" =~ ^[0-9]+$ ]] || ! [[ "$local_port_end" =~ ^[0-9]+$ ]]; then
             echo -e "${RED}错误: 无效端口${NC}"
             return
         fi
         
-        echo -ne "${YELLOW}本地结束端口: ${NC}"
-        read local_port_end
-        
-        if ! [[ "$local_port_end" =~ ^[0-9]+$ ]] || [ "$local_port_end" -le "$local_port_start" ] || [ "$local_port_end" -gt 65535 ]; then
-            echo -e "${RED}错误: 无效端口或范围${NC}"
+        if [ "$local_port_start" -ge "$local_port_end" ]; then
+            echo -e "${RED}错误: 起始端口必须小于结束端口${NC}"
             return
         fi
         
@@ -463,9 +465,16 @@ show_all_rules() {
     echo -e "\n${BLUE}═══ 系统状态 ═══${NC}"
     local forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
     if [ "$forward" = "1" ]; then
-        echo -e "IP转发: ${GREEN}✓ 已启用${NC}"
+        echo -e "IPv4转发: ${GREEN}✓ 已启用${NC}"
     else
-        echo -e "IP转发: ${RED}✗ 未启用${NC}"
+        echo -e "IPv4转发: ${RED}✗ 未启用${NC}"
+    fi
+    
+    local forward_v6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
+    if [ "$forward_v6" = "1" ]; then
+        echo -e "IPv6转发: ${GREEN}✓ 已启用${NC}"
+    else
+        echo -e "IPv6转发: ${RED}✗ 未启用${NC}"
     fi
     
     local nat_count=$(nft list table inet $NFT_TABLE 2>/dev/null | grep -c "dnat to" || echo 0)
@@ -482,7 +491,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${CYAN}╔════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║   NFTables 防火墙+转发 一体化管理工具 (修复版)     ║${NC}"
+        echo -e "${CYAN}║   NFTables 防火墙+转发 一体化管理工具 (IPv6修复)   ║${NC}"
         echo -e "${CYAN}║   规则: 只有白名单IP可访问VPS                     ║${NC}"
         echo -e "${CYAN}╚════════════════════════════════════════════════════╝${NC}"
         echo ""
