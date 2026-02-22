@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# NFTables 防火墙 + 端口转发 一体化管理脚本 (IPv6修复版)
+# NFTables 防火墙 + 端口转发 一体化管理脚本 (IPv6修复版 + UDP修复版)
 # 核心规则：只有白名单IP才能访问VPS（包括转发端口）
 
 # 颜色定义
@@ -161,7 +161,7 @@ table inet unified {
         drop
     }
     
-    # Forward链 - 转发控制 (关键修复：默认Drop，只允许白名单)
+    # Forward链 - 转发控制 (默认Drop，只允许白名单)
     chain forward {
         type filter hook forward priority filter; policy drop;
         
@@ -171,9 +171,13 @@ table inet unified {
         # 允许ICMPv6转发 (用于IPv6路径MTU发现等)
         ip6 nexthdr icmpv6 accept
         
-        # 只允许白名单IP进行转发访问
+        # 只允许白名单IP发起转发访问
         ip saddr @allowed_ips accept
         ip6 saddr @allowed_ips_v6 accept
+        
+        # 允许DNAT后的回包通过（目标服务器响应，源IP不在白名单）
+        # 修复UDP转发：UDP无连接状态，回包依赖ct status dnat匹配
+        ct status dnat accept
         
         # 拒绝其他所有转发请求
         drop
@@ -237,7 +241,7 @@ RULESET
     systemctl enable nftables 2>/dev/null || true
     
     rm -f "$temp_rules"
-    echo -e "${GREEN}✓ 规则已应用 - 防火墙与转发均已生效${NC}"
+    echo -e "${GREEN}✓ 规则已应用 - 防火墙与转发均已生效（TCP+UDP）${NC}"
 }
 
 # 内部添加转发规则 (NAT逻辑)
@@ -258,20 +262,53 @@ add_forward_rules_internal() {
     nft add rule inet $NFT_TABLE postrouting $ip_family daddr $tip $proto dport $tport counter masquerade comment \"$handle\" 2>/dev/null
 }
 
-# 清除所有规则
+# 清除规则（可选择类型）
 clear_all_rules() {
-    echo -e "${RED}警告: 将清除所有防火墙和转发规则！${NC}"
-    echo -ne "确认清除? [y/N]: "
-    read -r confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        nft delete table inet $NFT_TABLE 2>/dev/null || true
-        nft delete table inet filter 2>/dev/null || true
-        nft delete table inet whitelist_filter 2>/dev/null || true
-        nft delete table inet port_forward 2>/dev/null || true
-        rm -f /etc/nftables.d/*.nft
-        sed -i '\|/etc/nftables.d/|d' /etc/nftables.conf 2>/dev/null
-        echo -e "${GREEN}✓ 已清除所有规则${NC}"
-    fi
+    echo -e "\n${BLUE}【清除规则】${NC}"
+    echo -e "${GREEN}1.${NC} 清除所有白名单IP"
+    echo -e "${GREEN}2.${NC} 清除所有转发端口"
+    echo -e "${GREEN}3.${NC} 清除全部（白名单+转发）"
+    echo -e "${GREEN}0.${NC} 取消"
+    echo -ne "${YELLOW}选择: ${NC}"
+    read clear_choice
+
+    case $clear_choice in
+        1)
+            echo -ne "${RED}确认清除所有白名单IP? [y/N]: ${NC}"
+            read confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                > "$WHITELIST_FILE"
+                apply_all_rules
+                echo -e "${GREEN}✓ 已清除所有白名单IP${NC}"
+            fi
+            ;;
+        2)
+            echo -ne "${RED}确认清除所有转发端口? [y/N]: ${NC}"
+            read confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                > "$FORWARD_FILE"
+                apply_all_rules
+                echo -e "${GREEN}✓ 已清除所有转发端口${NC}"
+            fi
+            ;;
+        3)
+            echo -ne "${RED}确认清除全部规则（白名单+转发+nftables表）? [y/N]: ${NC}"
+            read confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                nft delete table inet $NFT_TABLE 2>/dev/null || true
+                nft delete table inet filter 2>/dev/null || true
+                nft delete table inet whitelist_filter 2>/dev/null || true
+                nft delete table inet port_forward 2>/dev/null || true
+                > "$WHITELIST_FILE"
+                > "$FORWARD_FILE"
+                rm -f /etc/nftables.d/*.nft
+                sed -i '\|/etc/nftables.d/|d' /etc/nftables.conf 2>/dev/null
+                echo -e "${GREEN}✓ 已清除全部规则${NC}"
+            fi
+            ;;
+        0) return ;;
+        *) echo -e "${RED}无效选择${NC}" ;;
+    esac
 }
 
 # 启用IP转发
@@ -292,7 +329,7 @@ enable_ip_forward() {
         sed -i 's/^net.ipv6.conf.all.forwarding=.*/net.ipv6.conf.all.forwarding=1/' /etc/sysctl.conf
     fi
     
-    echo -e "${GREEN}✓ IP转发已启用${NC}"
+    echo -e "${GREEN}✓ IP转发已启用（IPv4 + IPv6）${NC}"
 }
 
 # 添加端口转发
@@ -312,8 +349,17 @@ add_forward() {
         *) echo -e "${RED}无效选择${NC}"; return ;;
     esac
     
-    echo -ne "${YELLOW}是否添加端口段? [y/N]: ${NC}"
-    read is_range
+    echo -e "${GREEN}1.${NC} 单个端口"
+    echo -e "${GREEN}2.${NC} 端口段"
+    echo -ne "${YELLOW}端口类型: ${NC}"
+    read port_type_choice
+    
+    local is_range
+    case $port_type_choice in
+        1) is_range="n" ;;
+        2) is_range="y" ;;
+        *) echo -e "${RED}无效选择${NC}"; return ;;
+    esac
     
     if [[ "$is_range" =~ ^[Yy]$ ]]; then
         # 端口段
@@ -490,10 +536,9 @@ show_all_rules() {
 main_menu() {
     while true; do
         clear
-        echo -e "${CYAN}╔════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║   NFTables 防火墙+转发 一体化管理工具 (IPv6修复)   ║${NC}"
-        echo -e "${CYAN}║   规则: 只有白名单IP可访问VPS                     ║${NC}"
-        echo -e "${CYAN}╚════════════════════════════════════════════════════╝${NC}"
+        echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║   nftable白名单IP+端口转发脚本         ║${NC}"
+        echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "${BLUE}【白名单管理】${NC}"
         echo -e "${GREEN}1.${NC} 添加IP到白名单"
