@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# NFTables 防火墙 + 端口转发 一体化管理脚本 (IPv6修复版 + UDP修复版)
-# 核心规则：只有白名单IP才能访问VPS（包括转发端口）
+# NFTables 防火墙 + 端口转发 一体化管理脚本
+# 支持白名单开关、端口转发（TCP+UDP默认）、白名单保护转发端口
 
 # 颜色定义
 RED='\033[0;31m'
@@ -15,6 +15,7 @@ NC='\033[0m'
 # 配置文件
 WHITELIST_FILE="/etc/nftables_whitelist.txt"
 FORWARD_FILE="/etc/port_forward_nft.conf"
+WHITELIST_ENABLED_FILE="/etc/nftables_whitelist_enabled"
 
 # 表名
 NFT_TABLE="unified"
@@ -38,6 +39,13 @@ check_nftables() {
 init_files() {
     [ ! -f "$WHITELIST_FILE" ] && touch "$WHITELIST_FILE"
     [ ! -f "$FORWARD_FILE" ] && touch "$FORWARD_FILE"
+    # 默认白名单启用
+    [ ! -f "$WHITELIST_ENABLED_FILE" ] && echo "1" > "$WHITELIST_ENABLED_FILE"
+}
+
+# 获取白名单开关状态
+is_whitelist_enabled() {
+    [ -f "$WHITELIST_ENABLED_FILE" ] && [ "$(cat $WHITELIST_ENABLED_FILE)" = "1" ]
 }
 
 # 获取SSH IP
@@ -83,10 +91,16 @@ remove_from_whitelist() {
 
 # 显示白名单
 show_whitelist() {
-    echo -e "${BLUE}当前白名单:${NC}"
+    local status
+    if is_whitelist_enabled; then
+        status="${GREEN}[已启用]${NC}"
+    else
+        status="${RED}[已关闭]${NC}"
+    fi
+    echo -e "${BLUE}当前白名单 $status${NC}"
     echo "=========================================="
     if [ ! -s "$WHITELIST_FILE" ]; then
-        echo -e "${YELLOW}(空白名单 - 警告: 所有访问将被拒绝)${NC}"
+        echo -e "${YELLOW}(白名单为空)${NC}"
     else
         local count=1
         while IFS= read -r line; do
@@ -111,86 +125,105 @@ apply_all_rules() {
     
     local temp_rules="/tmp/nftables_unified_$$.conf"
     
-    cat > "$temp_rules" << 'RULESET'
-# 统一表 - 包含 NAT 和 Filter
+    if is_whitelist_enabled; then
+        # 白名单启用模式：input/forward 默认 drop
+        cat > "$temp_rules" << 'RULESET'
 table inet unified {
-    # 白名单集合
     set allowed_ips {
         type ipv4_addr
         flags interval
         auto-merge
     }
-    
     set allowed_ips_v6 {
         type ipv6_addr
         flags interval
         auto-merge
     }
-    
-    # NAT链 - 端口转发
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
     }
-    
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
     }
-    
     chain output_nat {
         type nat hook output priority -100; policy accept;
     }
-    
-    # Filter链 - 白名单控制 (本机服务)
     chain input {
         type filter hook input priority filter; policy drop;
         
         # 本地回环
         iif lo accept
         
-        # 允许已建立的连接 (包括VPS主动访问外部后的回包)
-        ct state established,related accept
-        
-        # 允许ICMPv6 (必需，否则IPv6邻居发现等功能会失效)
+        # ICMPv6 必须放行
         ip6 nexthdr icmpv6 accept
         
-        # 白名单IP允许访问本机服务
+        # 白名单IP：无条件放行（包括新建连接）
         ip saddr @allowed_ips accept
         ip6 saddr @allowed_ips_v6 accept
         
-        # 拒绝其他所有
+        # 非白名单IP：只允许已建立连接的回包（VPS主动外出后的响应）
+        # new/invalid 状态的包直接 drop
+        ct state new,invalid drop
+        ct state established,related accept
+        
         drop
     }
-    
-    # Forward链 - 转发控制 (默认Drop，只允许白名单)
     chain forward {
         type filter hook forward priority filter; policy drop;
         
-        # 允许已建立的转发连接 (双向通信)
-        ct state established,related accept
-        
-        # 允许ICMPv6转发 (用于IPv6路径MTU发现等)
+        # ICMPv6 必须放行（IPv6邻居发现等）
         ip6 nexthdr icmpv6 accept
         
-        # 只允许白名单IP发起转发访问
+        # 目标服务器返回给VPS的回包（masquerade后源IP是目标服务器，不在白名单）
+        # 必须严格限定：只放行已建立连接的回包，且该连接是由DNAT触发的
+        ct status dnat ct state established,related accept
+        
+        # 白名单IP：允许新建连接及后续包
         ip saddr @allowed_ips accept
         ip6 saddr @allowed_ips_v6 accept
         
-        # 允许DNAT后的回包通过（目标服务器响应，源IP不在白名单）
-        # 修复UDP转发：UDP无连接状态，回包依赖ct status dnat匹配
-        ct status dnat accept
-        
-        # 拒绝其他所有转发请求
         drop
     }
-    
     chain output {
         type filter hook output priority filter; policy accept;
-        
-        # 允许所有出站连接 (VPS主动访问外部)
-        # 回包通过 input 链的 ct state established,related 处理
     }
 }
 RULESET
+    else
+        # 白名单关闭模式：input/forward 全放行，仅做转发NAT
+        cat > "$temp_rules" << 'RULESET'
+table inet unified {
+    set allowed_ips {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+    set allowed_ips_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+    }
+    chain output_nat {
+        type nat hook output priority -100; policy accept;
+    }
+    chain input {
+        type filter hook input priority filter; policy accept;
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+    }
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+RULESET
+    fi
 
     if ! nft -f "$temp_rules" 2>&1; then
         echo -e "${RED}✗ 规则应用失败${NC}"
@@ -198,7 +231,7 @@ RULESET
         return 1
     fi
     
-    # 添加白名单IP到集合
+    # 添加白名单IP到集合（即使白名单关闭也加载，方便随时切换）
     local has_whitelist=false
     while IFS= read -r ip; do
         has_whitelist=true
@@ -209,19 +242,15 @@ RULESET
         fi
     done < <(load_whitelist)
     
-    if [ "$has_whitelist" = false ]; then
-        echo -e "${RED}警告: 白名单为空，所有访问将被拒绝！${NC}"
+    if is_whitelist_enabled && [ "$has_whitelist" = false ]; then
+        echo -e "${RED}警告: 白名单已启用但为空，所有访问将被拒绝！${NC}"
     fi
     
-    # 重新加载端口转发规则
+    # 重新加载端口转发规则（统一 TCP+UDP）
     if [ -s "$FORWARD_FILE" ]; then
-        while IFS='|' read -r proto lport tip tport; do
-            if [ "$proto" = "both" ]; then
-                add_forward_rules_internal "tcp" "$lport" "$tip" "$tport"
-                add_forward_rules_internal "udp" "$lport" "$tip" "$tport"
-            else
-                add_forward_rules_internal "$proto" "$lport" "$tip" "$tport"
-            fi
+        while IFS='|' read -r lport tip tport; do
+            add_forward_rules_internal "tcp" "$lport" "$tip" "$tport"
+            add_forward_rules_internal "udp" "$lport" "$tip" "$tport"
         done < "$FORWARD_FILE"
     fi
     
@@ -230,7 +259,6 @@ RULESET
     nft list table inet $NFT_TABLE > /etc/nftables.d/unified.nft
     
     if [ -f /etc/nftables.conf ]; then
-        # 确保不重复include
         if ! grep -q "include \"/etc/nftables.d/unified.nft\"" /etc/nftables.conf; then
             echo 'include "/etc/nftables.d/unified.nft"' >> /etc/nftables.conf
         fi
@@ -241,7 +269,12 @@ RULESET
     systemctl enable nftables 2>/dev/null || true
     
     rm -f "$temp_rules"
-    echo -e "${GREEN}✓ 规则已应用 - 防火墙与转发均已生效（TCP+UDP）${NC}"
+
+    if is_whitelist_enabled; then
+        echo -e "${GREEN}✓ 规则已应用 - 白名单模式${GREEN}[启用]${GREEN}，转发TCP+UDP均已生效${NC}"
+    else
+        echo -e "${GREEN}✓ 规则已应用 - 白名单模式${RED}[关闭]${GREEN}，转发TCP+UDP均已生效${NC}"
+    fi
 }
 
 # 内部添加转发规则 (NAT逻辑)
@@ -255,14 +288,14 @@ add_forward_rules_internal() {
     local ip_family="ip"
     [[ "$tip" =~ : ]] && ip_family="ip6"
     
-    # 添加DNAT规则
+    # DNAT 规则
     nft add rule inet $NFT_TABLE prerouting $ip_family daddr != $tip $proto dport $lport counter dnat to $tip:$tport comment \"$handle\" 2>/dev/null
     nft add rule inet $NFT_TABLE output_nat $ip_family daddr != $tip $proto dport $lport counter dnat to $tip:$tport comment \"$handle\" 2>/dev/null
-    # 添加Masquerade (SNAT) 规则，确保回包经过VPS
+    # Masquerade 确保回包经过VPS
     nft add rule inet $NFT_TABLE postrouting $ip_family daddr $tip $proto dport $tport counter masquerade comment \"$handle\" 2>/dev/null
 }
 
-# 清除规则（可选择类型）
+# 清除规则
 clear_all_rules() {
     echo -e "\n${BLUE}【清除规则】${NC}"
     echo -e "${GREEN}1.${NC} 清除所有白名单IP"
@@ -332,128 +365,117 @@ enable_ip_forward() {
     echo -e "${GREEN}✓ IP转发已启用（IPv4 + IPv6）${NC}"
 }
 
-# 添加端口转发
-add_forward() {
-    echo -e "\n${BLUE}【添加端口转发】${NC}"
-    echo -e "${GREEN}1.${NC} TCP"
-    echo -e "${GREEN}2.${NC} UDP"
-    echo -e "${GREEN}3.${NC} TCP+UDP"
-    echo -ne "${YELLOW}协议: ${NC}"
-    read proto_choice
+# 添加单个端口转发
+add_forward_single() {
+    echo -e "\n${BLUE}【添加单端口转发】${NC}"
     
-    local protocol
-    case $proto_choice in
-        1) protocol="tcp" ;;
-        2) protocol="udp" ;;
-        3) protocol="both" ;;
-        *) echo -e "${RED}无效选择${NC}"; return ;;
-    esac
+    echo -ne "${YELLOW}目标IP: ${NC}"
+    read target_ip
+    if [ -z "$target_ip" ]; then
+        echo -e "${RED}错误: 目标IP不能为空${NC}"
+        return
+    fi
     
-    echo -e "${GREEN}1.${NC} 单个端口"
-    echo -e "${GREEN}2.${NC} 端口段"
-    echo -ne "${YELLOW}端口类型: ${NC}"
-    read port_type_choice
+    echo -ne "${YELLOW}目标端口: ${NC}"
+    read target_port
+    if ! [[ "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
+        echo -e "${RED}错误: 无效目标端口${NC}"
+        return
+    fi
     
-    local is_range
-    case $port_type_choice in
-        1) is_range="n" ;;
-        2) is_range="y" ;;
-        *) echo -e "${RED}无效选择${NC}"; return ;;
-    esac
+    echo -ne "${YELLOW}本地端口: ${NC}"
+    read local_port
+    if ! [[ "$local_port" =~ ^[0-9]+$ ]] || [ "$local_port" -lt 1 ] || [ "$local_port" -gt 65535 ]; then
+        echo -e "${RED}错误: 无效本地端口${NC}"
+        return
+    fi
     
-    if [[ "$is_range" =~ ^[Yy]$ ]]; then
-        # 端口段
-        echo -ne "${YELLOW}本地起始端口: ${NC}"
-        read local_port_start
-        echo -ne "${YELLOW}本地结束端口: ${NC}"
-        read local_port_end
-        
-        if ! [[ "$local_port_start" =~ ^[0-9]+$ ]] || ! [[ "$local_port_end" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误: 无效端口${NC}"
-            return
-        fi
-        
-        if [ "$local_port_start" -ge "$local_port_end" ]; then
-            echo -e "${RED}错误: 起始端口必须小于结束端口${NC}"
-            return
-        fi
-        
-        echo -ne "${YELLOW}目标IP: ${NC}"
-        read target_ip
-        
-        echo -ne "${YELLOW}目标端口段与本地相同? [Y/n]: ${NC}"
-        read same_ports
-        
-        if [[ "$same_ports" =~ ^[Nn]$ ]]; then
-            echo -ne "${YELLOW}目标起始端口: ${NC}"
-            read target_port_start
-            echo -ne "${YELLOW}目标结束端口: ${NC}"
-            read target_port_end
-            
-            local local_range=$((local_port_end - local_port_start))
-            local target_range=$((target_port_end - target_port_start))
-            
-            if [ "$local_range" -ne "$target_range" ]; then
-                echo -e "${RED}错误: 端口段数量必须相同${NC}"
-                return
-            fi
-        else
-            target_port_start=$local_port_start
-            target_port_end=$local_port_end
-        fi
-        
-        local lport="${local_port_start}-${local_port_end}"
-        local tport="${target_port_start}-${target_port_end}"
-        
-        echo -e "\n${YELLOW}确认添加:${NC}"
-        echo -e "协议: ${GREEN}$protocol${NC}"
-        echo -e "本地: ${GREEN}$lport${NC} → 目标: ${GREEN}$target_ip:$tport${NC}"
-        echo -e "${RED}注意: 只有白名单IP才能访问此转发${NC}"
-        echo -ne "确认? [Y/n]: "
-        read confirm
-        
-        if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
-            echo "$protocol|$lport|$target_ip|$tport" >> "$FORWARD_FILE"
-            apply_all_rules
-            echo -e "${GREEN}✓ 已添加${NC}"
-        fi
-    else
-        # 单个端口
-        echo -ne "${YELLOW}本地端口: ${NC}"
-        read local_port
-        
-        if ! [[ "$local_port" =~ ^[0-9]+$ ]] || [ "$local_port" -lt 1 ] || [ "$local_port" -gt 65535 ]; then
-            echo -e "${RED}错误: 无效端口${NC}"
-            return
-        fi
-        
-        if grep -q "|${local_port}|" "$FORWARD_FILE" 2>/dev/null; then
-            echo -e "${RED}错误: 端口已存在${NC}"
-            return
-        fi
-        
-        echo -ne "${YELLOW}目标IP: ${NC}"
-        read target_ip
-        echo -ne "${YELLOW}目标端口: ${NC}"
-        read target_port
-        
-        if ! [[ "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
-            echo -e "${RED}错误: 无效端口${NC}"
-            return
-        fi
-        
-        echo -e "\n${YELLOW}确认添加:${NC}"
-        echo -e "协议: ${GREEN}$protocol${NC}"
-        echo -e "本地: ${GREEN}$local_port${NC} → 目标: ${GREEN}$target_ip:$target_port${NC}"
-        echo -e "${RED}注意: 只有白名单IP才能访问此转发${NC}"
-        echo -ne "确认? [Y/n]: "
-        read confirm
-        
-        if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
-            echo "$protocol|$local_port|$target_ip|$target_port" >> "$FORWARD_FILE"
-            apply_all_rules
-            echo -e "${GREEN}✓ 已添加${NC}"
-        fi
+    if grep -q "^${local_port}|" "$FORWARD_FILE" 2>/dev/null; then
+        echo -e "${RED}错误: 本地端口 $local_port 已存在转发规则${NC}"
+        return
+    fi
+    
+    echo -e "\n${YELLOW}确认添加:${NC}"
+    echo -e "  本地端口 ${GREEN}$local_port${NC} → 目标 ${GREEN}$target_ip:$target_port${NC}  [TCP+UDP]"
+    if is_whitelist_enabled; then
+        echo -e "  ${RED}注意: 只有白名单IP才能访问此转发${NC}"
+    fi
+    echo -ne "确认? [Y/n]: "
+    read confirm
+    
+    if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+        echo "$local_port|$target_ip|$target_port" >> "$FORWARD_FILE"
+        apply_all_rules
+        echo -e "${GREEN}✓ 已添加${NC}"
+    fi
+}
+
+# 添加端口段转发
+add_forward_range() {
+    echo -e "\n${BLUE}【添加端口段转发】${NC}"
+    
+    echo -ne "${YELLOW}目标IP: ${NC}"
+    read target_ip
+    if [ -z "$target_ip" ]; then
+        echo -e "${RED}错误: 目标IP不能为空${NC}"
+        return
+    fi
+    
+    echo -ne "${YELLOW}目标起始端口: ${NC}"
+    read target_port_start
+    echo -ne "${YELLOW}目标结束端口: ${NC}"
+    read target_port_end
+    
+    if ! [[ "$target_port_start" =~ ^[0-9]+$ ]] || ! [[ "$target_port_end" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 无效端口${NC}"
+        return
+    fi
+    if [ "$target_port_start" -ge "$target_port_end" ]; then
+        echo -e "${RED}错误: 起始端口必须小于结束端口${NC}"
+        return
+    fi
+    
+    echo -ne "${YELLOW}本地起始端口: ${NC}"
+    read local_port_start
+    echo -ne "${YELLOW}本地结束端口: ${NC}"
+    read local_port_end
+    
+    if ! [[ "$local_port_start" =~ ^[0-9]+$ ]] || ! [[ "$local_port_end" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误: 无效端口${NC}"
+        return
+    fi
+    if [ "$local_port_start" -ge "$local_port_end" ]; then
+        echo -e "${RED}错误: 起始端口必须小于结束端口${NC}"
+        return
+    fi
+    
+    local local_range=$((local_port_end - local_port_start))
+    local target_range=$((target_port_end - target_port_start))
+    if [ "$local_range" -ne "$target_range" ]; then
+        echo -e "${RED}错误: 端口段数量必须相同（本地 $((local_range+1)) 个 vs 目标 $((target_range+1)) 个）${NC}"
+        return
+    fi
+    
+    local lport="${local_port_start}-${local_port_end}"
+    local tport="${target_port_start}-${target_port_end}"
+    
+    if grep -q "^${lport}|" "$FORWARD_FILE" 2>/dev/null; then
+        echo -e "${RED}错误: 本地端口段 $lport 已存在转发规则${NC}"
+        return
+    fi
+    
+    echo -e "\n${YELLOW}确认添加:${NC}"
+    echo -e "  本地端口段 ${GREEN}$lport${NC} → 目标 ${GREEN}$target_ip:$tport${NC}  [TCP+UDP]"
+    if is_whitelist_enabled; then
+        echo -e "  ${RED}注意: 只有白名单IP才能访问此转发${NC}"
+    fi
+    echo -ne "确认? [Y/n]: "
+    read confirm
+    
+    if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+        echo "$lport|$target_ip|$tport" >> "$FORWARD_FILE"
+        apply_all_rules
+        echo -e "${GREEN}✓ 已添加${NC}"
     fi
 }
 
@@ -466,8 +488,8 @@ delete_forward() {
     
     echo -e "\n${BLUE}【当前转发规则】${NC}"
     local index=1
-    while IFS='|' read -r proto lport tip tport; do
-        echo -e "${GREEN}$index.${NC} [$proto] $lport → $tip:$tport"
+    while IFS='|' read -r lport tip tport; do
+        echo -e "${GREEN}$index.${NC} [TCP+UDP] 本地:$lport → $tip:$tport"
         ((index++))
     done < "$FORWARD_FILE"
     
@@ -487,6 +509,45 @@ delete_forward() {
     fi
 }
 
+# 切换白名单开关
+toggle_whitelist() {
+    echo -e "\n${BLUE}【白名单开关】${NC}"
+    if is_whitelist_enabled; then
+        echo -e "当前状态: ${GREEN}已启用${NC}"
+        echo -e "${YELLOW}关闭后所有IP均可访问本机及转发端口（不受限制）${NC}"
+        echo -ne "${RED}确认关闭白名单? [y/N]: ${NC}"
+        read confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            echo "0" > "$WHITELIST_ENABLED_FILE"
+            apply_all_rules
+            echo -e "${GREEN}✓ 白名单已关闭 - 所有IP均可访问${NC}"
+        fi
+    else
+        echo -e "当前状态: ${RED}已关闭${NC}"
+        local wl_count=$(load_whitelist | wc -l)
+        echo -e "白名单中有 ${WHITE}$wl_count${NC} 个IP"
+        if [ "$wl_count" -eq 0 ]; then
+            echo -e "${RED}警告: 白名单为空！启用后将拒绝所有访问（包括当前SSH连接）！${NC}"
+            local ssh_ip=$(get_current_ssh_ip)
+            if [ -n "$ssh_ip" ]; then
+                echo -e "当前SSH IP: ${GREEN}$ssh_ip${NC}"
+                echo -ne "是否先将当前SSH IP加入白名单? [Y/n]: "
+                read add_ssh
+                if [[ ! "$add_ssh" =~ ^[Nn]$ ]]; then
+                    add_to_whitelist "$ssh_ip"
+                fi
+            fi
+        fi
+        echo -ne "${YELLOW}确认启用白名单? [Y/n]: ${NC}"
+        read confirm
+        if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+            echo "1" > "$WHITELIST_ENABLED_FILE"
+            apply_all_rules
+            echo -e "${GREEN}✓ 白名单已启用${NC}"
+        fi
+    fi
+}
+
 # 显示所有规则
 show_all_rules() {
     clear
@@ -502,8 +563,8 @@ show_all_rules() {
         echo -e "${YELLOW}(无转发规则)${NC}"
     else
         local index=1
-        while IFS='|' read -r proto lport tip tport; do
-            echo -e "${GREEN}[$index]${NC} [$proto] $lport → $tip:$tport"
+        while IFS='|' read -r lport tip tport; do
+            echo -e "${GREEN}[$index]${NC} [TCP+UDP] 本地:$lport → $tip:$tport"
             ((index++))
         done < "$FORWARD_FILE"
     fi
@@ -529,35 +590,51 @@ show_all_rules() {
     local whitelist_count=$(load_whitelist | wc -l)
     echo -e "白名单IP: ${WHITE}$whitelist_count 个${NC}"
     
-    echo -e "\n${RED}重要: 只有白名单IP才能访问VPS（包括转发端口）${NC}"
+    if is_whitelist_enabled; then
+        echo -e "\n${RED}重要: 白名单已启用 - 只有白名单IP才能访问VPS（包括转发端口）${NC}"
+    else
+        echo -e "\n${YELLOW}提示: 白名单已关闭 - 所有IP均可访问（转发端口无限制）${NC}"
+    fi
 }
 
 # 主菜单
 main_menu() {
     while true; do
         clear
+        
+        # 白名单状态
+        local wl_status
+        if is_whitelist_enabled; then
+            wl_status="${GREEN}[白名单: 启用]${NC}"
+        else
+            wl_status="${RED}[白名单: 关闭]${NC}"
+        fi
+        
         echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
         echo -e "${CYAN}║   nftable白名单IP+端口转发脚本         ║${NC}"
         echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
+        echo -e "  状态: $wl_status"
         echo ""
         echo -e "${BLUE}【白名单管理】${NC}"
         echo -e "${GREEN}1.${NC} 添加IP到白名单"
         echo -e "${GREEN}2.${NC} 删除白名单IP"
+        echo -e "${GREEN}3.${NC} 启用/关闭白名单"
         echo ""
         echo -e "${BLUE}【端口转发】${NC}"
-        echo -e "${GREEN}3.${NC} 添加端口转发 (支持端口段)"
-        echo -e "${GREEN}4.${NC} 删除端口转发"
-        echo -e "${GREEN}5.${NC} 启用IP转发"
+        echo -e "${GREEN}4.${NC} 添加单端口转发"
+        echo -e "${GREEN}5.${NC} 添加端口段转发"
+        echo -e "${GREEN}6.${NC} 删除端口转发"
+        echo -e "${GREEN}7.${NC} 启用IP转发(sysctl)"
         echo ""
         echo -e "${BLUE}【系统】${NC}"
-        echo -e "${GREEN}6.${NC} 应用所有规则"
-        echo -e "${GREEN}7.${NC} 查看所有规则"
-        echo -e "${GREEN}8.${NC} 清除所有规则"
-        echo -e "${GREEN}9.${NC} 导出配置"
-        echo -e "${GREEN}10.${NC} 导入配置"
+        echo -e "${GREEN}8.${NC} 应用所有规则"
+        echo -e "${GREEN}9.${NC} 查看所有规则"
+        echo -e "${GREEN}10.${NC} 清除所有规则"
+        echo -e "${GREEN}11.${NC} 导出配置"
+        echo -e "${GREEN}12.${NC} 导入配置"
         echo -e "${GREEN}0.${NC} 退出"
         echo ""
-        echo -ne "选择 [0-10]: "
+        echo -ne "选择 [0-12]: "
         read choice
         
         case $choice in
@@ -579,18 +656,20 @@ main_menu() {
                     remove_from_whitelist "$input" && apply_all_rules
                 fi
                 ;;
-            3) add_forward ;;
-            4) delete_forward ;;
-            5) enable_ip_forward ;;
-            6) apply_all_rules ;;
-            7) show_all_rules ;;
-            8) clear_all_rules ;;
-            9)
+            3) toggle_whitelist ;;
+            4) add_forward_single ;;
+            5) add_forward_range ;;
+            6) delete_forward ;;
+            7) enable_ip_forward ;;
+            8) apply_all_rules ;;
+            9) show_all_rules ;;
+            10) clear_all_rules ;;
+            11)
                 local backup="nftables_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-                tar -czf "$backup" "$WHITELIST_FILE" "$FORWARD_FILE" 2>/dev/null
+                tar -czf "$backup" "$WHITELIST_FILE" "$FORWARD_FILE" "$WHITELIST_ENABLED_FILE" 2>/dev/null
                 echo -e "${GREEN}✓ 已导出: $backup${NC}"
                 ;;
-            10)
+            12)
                 echo -ne "备份文件路径: "
                 read backup_file
                 if [ -f "$backup_file" ]; then
@@ -637,9 +716,10 @@ initial_setup() {
     fi
     
     echo -e "${RED}重要提示:${NC}"
-    echo "1. 应用规则后，只有白名单IP才能访问VPS"
-    echo "2. 端口转发也受白名单限制"
-    echo "3. 请确保至少添加一个可信IP"
+    echo "1. 白名单默认启用，应用规则后只有白名单IP才能访问VPS"
+    echo "2. 端口转发也受白名单限制（白名单启用时）"
+    echo "3. 可随时在菜单中启用/关闭白名单，不影响转发规则"
+    echo "4. 请确保至少添加一个可信IP"
     echo ""
     echo -n "按回车继续..."
     read
