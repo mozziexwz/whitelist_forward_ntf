@@ -2,5 +2,5 @@
 
 
 ```
-curl -O https://raw.githubusercontent.com/mozziexwz/whitelist_forward_ntf/refs/heads/main/wf_ntf.sh && chmod +x wf_ntf.sh && ./wf_ntf.sh
+curl -O https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/refs/heads/main/nft.sh && chmod +x wf_ntf.sh && ./wf_ntf.sh
 ```
